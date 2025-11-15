@@ -43,6 +43,16 @@ const routes = [
                 name: 'campaigns',
                 component: () => import('../pages/Campaigns.vue'),
             },
+            {
+                path: '/tradeins',
+                name: 'tradeins',
+                component: () => import('../pages/TradeIns.vue'),
+            },
+            {
+                path: '/tradein-base-prices',
+                name: 'tradein-base-prices',
+                component: () => import('../pages/TradeInBasePrices.vue'),
+            },
         ],
     },
 ];

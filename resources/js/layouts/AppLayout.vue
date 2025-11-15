@@ -84,6 +84,7 @@ import {
     BuildingStorefrontIcon,
     DocumentTextIcon,
     SpeakerWaveIcon,
+    ArrowPathIcon,
     Bars3Icon,
 } from '@heroicons/vue/24/outline';
 import { useAuthStore } from '../stores/auth';
@@ -100,6 +101,8 @@ const navigation = computed(() => [
     { name: 'price-matrix', to: '/price-matrix', label: 'Price Matrix', icon: CurrencyDollarIcon },
     { name: 'stores', to: '/stores', label: 'Stores', icon: BuildingStorefrontIcon },
     { name: 'campaigns', to: '/campaigns', label: 'Campaigns', icon: SpeakerWaveIcon },
+    { name: 'tradeins', to: '/tradeins', label: 'Trade-Ins', icon: ArrowPathIcon },
+    { name: 'tradein-base-prices', to: '/tradein-base-prices', label: 'Base Prices', icon: CurrencyDollarIcon },
 ]);
 
 const handleLogout = async () => {

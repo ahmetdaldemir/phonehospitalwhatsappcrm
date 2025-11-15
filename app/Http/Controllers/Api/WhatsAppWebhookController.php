@@ -5,9 +5,16 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\BotSession;
 use App\Models\Customer;
+use App\Models\Order;
 use App\Models\PriceMatrix;
+use App\Models\Product;
+use App\Models\ProductRecommendation;
 use App\Models\Ticket;
+use App\Models\TradeIn;
+use App\Services\TradeInPriceEngine;
+use App\Services\TradeInPricingService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -162,6 +169,76 @@ class WhatsAppWebhookController extends Controller
             return;
         }
 
+        // Handle trade-in storage selection
+        if ($currentState === 'tradein_ask_storage' && isset($stateConfig['storage_map'][$text])) {
+            $storage = $stateConfig['storage_map'][$text];
+            $session->updateState('tradein_ask_color', [
+                'storage' => $storage,
+            ]);
+            $this->processState($session, 'tradein_ask_color');
+            return;
+        }
+
+        // Handle trade-in condition selection
+        if ($currentState === 'tradein_ask_condition' && isset($stateConfig['condition_map'][$text])) {
+            $condition = $stateConfig['condition_map'][$text];
+            $session->updateState('tradein_ask_battery', [
+                'condition' => $condition,
+            ]);
+            $this->processState($session, 'tradein_ask_battery');
+            return;
+        }
+
+        // Handle trade-in battery health
+        if ($currentState === 'tradein_ask_battery') {
+            $batteryHealth = null;
+            if (strtolower($text) !== 'bilmiyorum' && is_numeric($text)) {
+                $batteryHealth = (int) $text;
+                if ($batteryHealth < 0) $batteryHealth = 0;
+                if ($batteryHealth > 100) $batteryHealth = 100;
+            }
+            $session->updateState('tradein_ask_photos', [
+                'battery_health' => $batteryHealth,
+            ]);
+            $this->processState($session, 'tradein_ask_photos');
+            return;
+        }
+
+        // Handle trade-in photos done
+        if ($currentState === 'tradein_wait_photos' && (strtolower($text) === 'tamam' || strtolower($text) === 'done')) {
+            $session->updateState('tradein_calculate_price');
+            $this->processState($session, 'tradein_calculate_price');
+            return;
+        }
+
+        // Handle trade-in payment option selection
+        if ($currentState === 'tradein_ask_payment' && isset($stateConfig['payment_map'][$text])) {
+            $paymentOption = $stateConfig['payment_map'][$text];
+            $session->updateState('tradein_create', [
+                'payment_option' => $paymentOption,
+            ]);
+            $this->processState($session, 'tradein_create');
+            return;
+        }
+
+        // Handle product selection (numeric input)
+        if ($currentState === 'product_selection' && is_numeric($text)) {
+            $productNumber = (int) $text;
+            $availableProducts = $session->data['available_products'] ?? [];
+            
+            if (isset($availableProducts[$productNumber])) {
+                $nextState = $stateConfig['next_states']['*'] ?? 'create_order_draft';
+                $session->updateState($nextState, [
+                    'selected_product' => $productNumber,
+                ]);
+                $this->processState($session, $nextState);
+                return;
+            } else {
+                $this->sendMessage($session->phone_number, 'Geçersiz ürün numarası. Lütfen tekrar deneyin.');
+                return;
+            }
+        }
+
         // Save data if data_key is specified
         if (isset($stateConfig['data_key']) && $nextState) {
             $session->updateState($nextState, [
@@ -191,8 +268,8 @@ class WhatsAppWebhookController extends Controller
     {
         $currentState = $session->current_state;
 
-        // Only accept media in wait_for_photos state
-        if ($currentState !== 'wait_for_photos') {
+        // Only accept media in wait_for_photos or tradein_wait_photos state
+        if ($currentState !== 'wait_for_photos' && $currentState !== 'tradein_wait_photos') {
             $this->sendMessage($session->phone_number, 'Please send photos only when requested. Type "back" to return to main menu.');
             return;
         }
@@ -220,7 +297,11 @@ class WhatsAppWebhookController extends Controller
             $this->sendMessage($session->phone_number, '✅ Photo received! Send another photo or type "done" to continue.');
         } catch (\Exception $e) {
             Log::error('Media handling error', ['error' => $e->getMessage()]);
-            $this->sendMessage($session->phone_number, 'Sorry, there was an error processing your photo. Please try again or type "done" to continue.');
+            if ($session->current_state === 'tradein_wait_photos') {
+                $this->sendMessage($session->phone_number, 'Fotoğraf işlenirken bir hata oluştu. Lütfen tekrar deneyin veya "tamam" yazın.');
+            } else {
+                $this->sendMessage($session->phone_number, 'Sorry, there was an error processing your photo. Please try again or type "done" to continue.');
+            }
         }
     }
 
@@ -272,6 +353,24 @@ class WhatsAppWebhookController extends Controller
                     break;
                 case 'show_ticket_status':
                     $this->showTicketStatus($session);
+                    return; // Message already sent in method
+                case 'show_products':
+                    $this->showProducts($session);
+                    return; // Message already sent in method
+                case 'create_order_draft':
+                    $this->createOrderDraft($session);
+                    return; // Message already sent in method
+                case 'show_order_status':
+                    $this->showOrderStatus($session);
+                    return; // Message already sent in method
+                case 'calculate_tradein_price':
+                    $this->calculateTradeInPrice($session);
+                    return; // Message already sent in method
+                case 'create_tradein':
+                    $this->createTradeIn($session);
+                    return; // Message already sent in method
+                case 'show_tradein_status':
+                    $this->showTradeInStatus($session);
                     return; // Message already sent in method
             }
         }
@@ -538,6 +637,426 @@ class WhatsAppWebhookController extends Controller
         }
 
         return $message;
+    }
+
+    /**
+     * Show recommended products for the device model.
+     *
+     * @param  \App\Models\BotSession  $session
+     * @return void
+     */
+    protected function showProducts(BotSession $session): void
+    {
+        try {
+            $data = $session->data ?? [];
+            $model = $data['model'] ?? null;
+
+            if (!$model) {
+                $this->sendMessage($session->phone_number, 'Model bilgisi bulunamadı. Lütfen tekrar deneyin.');
+                $session->updateState('start');
+                return;
+            }
+
+            // Get recommended products
+            $recommendations = ProductRecommendation::with('product')
+                ->forModel($model)
+                ->orderedByPriority()
+                ->whereHas('product', function ($query) {
+                    $query->active()->inStock();
+                })
+                ->limit(3)
+                ->get();
+
+            // If no recommendations, get random products
+            if ($recommendations->isEmpty()) {
+                $products = Product::active()
+                    ->inStock()
+                    ->inRandomOrder()
+                    ->limit(3)
+                    ->get();
+            } else {
+                $products = $recommendations->pluck('product');
+            }
+
+            if ($products->isEmpty()) {
+                $this->sendMessage($session->phone_number, 'Üzgünüz, şu anda uygun ürün bulunmamaktadır.');
+                $session->updateState('ask_further_help');
+                return;
+            }
+
+            // Format products list
+            $productsList = "📱 *Modelinize Uygun Aksesuarlar:*\n\n";
+            $productIds = [];
+
+            foreach ($products as $index => $product) {
+                $number = $index + 1;
+                $productsList .= "{$number}. *{$product->name}*\n";
+                $productsList .= "   💰 Fiyat: {$product->price} TL\n";
+                if ($product->description) {
+                    $productsList .= "   📝 {$product->description}\n";
+                }
+                $productsList .= "\n";
+                $productIds[$number] = $product->id;
+            }
+
+            // Store product IDs in session for order creation
+            $session->setData('available_products', $productIds);
+            $session->updateState('product_selection');
+
+            // Send products list
+            $message = $productsList . "\nSatın almak istediğiniz ürün numarasını yazın (örn: 1, 2, 3) veya 'iptal' yazın.";
+            $this->sendMessage($session->phone_number, $message);
+        } catch (\Exception $e) {
+            Log::error('Show products error', [
+                'error' => $e->getMessage(),
+                'session_id' => $session->id,
+            ]);
+            $this->sendMessage($session->phone_number, 'Ürünler yüklenirken bir hata oluştu. Lütfen tekrar deneyin.');
+            $session->updateState('ask_further_help');
+        }
+    }
+
+    /**
+     * Create order draft from session.
+     *
+     * @param  \App\Models\BotSession  $session
+     * @return void
+     */
+    protected function createOrderDraft(BotSession $session): void
+    {
+        try {
+            $data = $session->data ?? [];
+            $selectedProduct = $data['selected_product'] ?? null;
+            $availableProducts = $data['available_products'] ?? [];
+
+            if (!$selectedProduct || !isset($availableProducts[$selectedProduct])) {
+                $this->sendMessage($session->phone_number, 'Geçersiz ürün seçimi. Lütfen tekrar deneyin.');
+                $session->updateState('show_products');
+                return;
+            }
+
+            $productId = $availableProducts[$selectedProduct];
+            $product = Product::find($productId);
+
+            if (!$product || !$product->is_active || $product->stock <= 0) {
+                $this->sendMessage($session->phone_number, 'Seçilen ürün şu anda mevcut değil.');
+                $session->updateState('ask_further_help');
+                return;
+            }
+
+            // Get customer
+            $customer = Customer::where('phone_number', $session->phone_number)->first();
+            if (!$customer) {
+                $this->sendMessage($session->phone_number, 'Müşteri bilgisi bulunamadı.');
+                $session->updateState('start');
+                return;
+            }
+
+            // Create order draft
+            $order = Order::create([
+                'customer_id' => $customer->id,
+                'ticket_id' => $session->ticket_id,
+                'store_id' => null, // Will be assigned later
+                'total_price' => $product->price,
+                'payment_status' => 'pending',
+                'order_status' => 'draft',
+            ]);
+
+            // Create order item
+            $order->orderItems()->create([
+                'product_id' => $product->id,
+                'quantity' => 1,
+                'price' => $product->price,
+            ]);
+
+            // Update session
+            $session->setData('order_id', $order->id);
+            $session->update(['order_id' => $order->id]);
+
+            // Get pickup instructions
+            $pickupInstructions = $this->getPickupInstructions($order);
+
+            // Send confirmation
+            $message = "✅ *Siparişiniz Oluşturuldu!*\n\n";
+            $message .= "Sipariş No: " . substr($order->id, 0, 8) . "\n";
+            $message .= "Ürün: {$product->name}\n";
+            $message .= "Toplam: {$order->total_price} TL\n\n";
+            $message .= "{$pickupInstructions}\n\n";
+            $message .= "Başka bir şey için yardımcı olabilir miyim?\n\n1. Yeni talep\n2. Sipariş durumu\n3. Hayır, teşekkürler";
+
+            $this->sendMessage($session->phone_number, $message);
+            $session->updateState('order_created');
+        } catch (\Exception $e) {
+            Log::error('Create order draft error', [
+                'error' => $e->getMessage(),
+                'session_id' => $session->id,
+            ]);
+            $this->sendMessage($session->phone_number, 'Sipariş oluşturulurken bir hata oluştu. Lütfen tekrar deneyin.');
+            $session->updateState('ask_further_help');
+        }
+    }
+
+    /**
+     * Show order status.
+     *
+     * @param  \App\Models\BotSession  $session
+     * @return void
+     */
+    protected function showOrderStatus(BotSession $session): void
+    {
+        $orderId = $session->data['order_id_search'] ?? null;
+
+        if (!$orderId) {
+            $this->sendMessage($session->phone_number, 'Sipariş bulunamadı. Lütfen sipariş numaranızı kontrol edin.');
+            $session->updateState('start');
+            return;
+        }
+
+        $order = Order::with(['customer', 'store', 'orderItems.product'])->find($orderId);
+
+        if (!$order) {
+            $this->sendMessage($session->phone_number, 'Sipariş bulunamadı. Lütfen sipariş numaranızı kontrol edin.');
+            $session->updateState('start');
+            return;
+        }
+
+        $statusEmoji = [
+            'draft' => '📝',
+            'in_store' => '🏪',
+            'on_the_way' => '🚚',
+            'delivered' => '✅',
+        ];
+
+        $paymentEmoji = [
+            'pending' => '⏳',
+            'paid' => '✅',
+            'canceled' => '❌',
+        ];
+
+        $message = "📦 *Sipariş Durumu*\n\n";
+        $message .= "Sipariş No: " . substr($order->id, 0, 8) . "\n";
+        $message .= "Durum: {$statusEmoji[$order->order_status] ?? ''} {$order->order_status}\n";
+        $message .= "Ödeme: {$paymentEmoji[$order->payment_status] ?? ''} {$order->payment_status}\n";
+        $message .= "Toplam: {$order->total_price} TL\n\n";
+
+        if ($order->orderItems->isNotEmpty()) {
+            $message .= "*Ürünler:*\n";
+            foreach ($order->orderItems as $item) {
+                $message .= "• {$item->product->name} x{$item->quantity} - {$item->price} TL\n";
+            }
+        }
+
+        if ($order->store) {
+            $message .= "\nMağaza: {$order->store->name}";
+            if ($order->store->address) {
+                $message .= "\nAdres: {$order->store->address}";
+            }
+        }
+
+        $this->sendMessage($session->phone_number, $message);
+        $session->updateState('start');
+    }
+
+    /**
+     * Get pickup instructions for order.
+     *
+     * @param  \App\Models\Order  $order
+     * @return string
+     */
+    protected function getPickupInstructions(Order $order): string
+    {
+        if ($order->store) {
+            return sprintf(
+                "Siparişiniz hazır olduğunda %s mağazamızdan teslim alabilirsiniz.\n\nAdres: %s",
+                $order->store->name,
+                $order->store->address ?? 'Adres bilgisi için mağazamızla iletişime geçin'
+            );
+        }
+
+        return "Siparişiniz hazır olduğunda size bildirilecektir.";
+    }
+
+    /**
+     * Calculate trade-in price.
+     *
+     * @param  \App\Models\BotSession  $session
+     * @return void
+     */
+    protected function calculateTradeInPrice(BotSession $session): void
+    {
+        try {
+            $data = $session->data ?? [];
+            $brand = $data['brand'] ?? null;
+            $model = $data['model'] ?? null;
+            $condition = $data['condition'] ?? 'B';
+            $batteryHealth = $data['battery_health'] ?? null;
+            $storage = $data['storage'] ?? null;
+
+            if (!$brand || !$model) {
+                $this->sendMessage($session->phone_number, 'Marka veya model bilgisi bulunamadı. Lütfen tekrar deneyin.');
+                $session->updateState('start');
+                return;
+            }
+
+            $pricingService = new TradeInPricingService();
+            $priceResult = $pricingService->calculateTradeInPrice($brand, $model, $storage, $condition, $batteryHealth);
+
+            // Store price in session
+            $session->setData('offer_min', $priceResult['min']);
+            $session->setData('offer_max', $priceResult['max']);
+
+            // Update session state
+            $session->updateState('tradein_show_offer');
+
+            // Format message
+            $conditionLabels = ['A' => 'Mükemmel', 'B' => 'İyi', 'C' => 'Orta'];
+            $conditionLabel = $conditionLabels[$condition] ?? 'Bilinmiyor';
+
+            $message = "💰 *Fiyat Teklifiniz*\n\n";
+            $message .= "Marka: {$brand}\n";
+            $message .= "Model: {$model}\n";
+            $message .= "Durum: {$conditionLabel}\n";
+            if ($storage) {
+                $message .= "Depolama: {$storage}\n";
+            }
+            if ($batteryHealth !== null) {
+                $message .= "Pil Sağlığı: %{$batteryHealth}\n";
+            }
+            $message .= "\n";
+            $message .= "Teklif Aralığı: {$priceResult['min']} - {$priceResult['max']} TL\n\n";
+            $message .= "Bu teklifi kabul ediyor musunuz?\n\n1. Evet, kabul ediyorum\n2. Hayır, teşekkürler";
+
+            $this->sendMessage($session->phone_number, $message);
+        } catch (\Exception $e) {
+            Log::error('Calculate trade-in price error', [
+                'error' => $e->getMessage(),
+                'session_id' => $session->id,
+            ]);
+            $this->sendMessage($session->phone_number, 'Fiyat hesaplanırken bir hata oluştu. Lütfen tekrar deneyin.');
+            $session->updateState('start');
+        }
+    }
+
+    /**
+     * Create trade-in from session.
+     *
+     * @param  \App\Models\BotSession  $session
+     * @return void
+     */
+    protected function createTradeIn(BotSession $session): void
+    {
+        try {
+            $data = $session->data ?? [];
+
+            // Get or create customer
+            $customer = Customer::firstOrCreate(
+                ['phone_number' => $session->phone_number],
+                [
+                    'name' => $data['customer_name'] ?? null,
+                    'total_visits' => 0,
+                ]
+            );
+
+            // Record visit
+            $customer->recordVisit();
+
+            // Create trade-in
+            $tradeIn = TradeIn::create([
+                'customer_id' => $customer->id,
+                'brand' => $data['brand'] ?? 'Unknown',
+                'model' => $data['model'] ?? 'Unknown',
+                'storage' => $data['storage'] ?? null,
+                'color' => $data['color'] ?? null,
+                'condition' => $data['condition'] ?? 'B',
+                'battery_health' => $data['battery_health'] ?? null,
+                'photos' => $data['photos'] ?? null,
+                'offer_min' => $data['offer_min'] ?? null,
+                'offer_max' => $data['offer_max'] ?? null,
+                'final_price' => null, // Will be set by admin if needed
+                'payment_option' => $data['payment_option'] ?? null,
+                'status' => 'new',
+            ]);
+
+            // Update session
+            $session->update([
+                'customer_id' => $customer->id,
+                'tradein_id' => $tradeIn->id,
+            ]);
+
+            // Send confirmation
+            $message = "✅ *Teklifiniz Kaydedildi!*\n\n";
+            $message .= "Teklif No: " . substr($tradeIn->id, 0, 8) . "\n";
+            $message .= "Marka: {$tradeIn->brand}\n";
+            $message .= "Model: {$tradeIn->model}\n";
+            $message .= "Teklif: {$tradeIn->offer_min} - {$tradeIn->offer_max} TL\n\n";
+            $message .= "En kısa sürede sizinle iletişime geçeceğiz. Başka bir şey için yardımcı olabilir miyim?\n\n";
+            $message .= "1. Yeni talep\n2. Teklif durumu\n3. Hayır, teşekkürler";
+
+            $this->sendMessage($session->phone_number, $message);
+            $session->updateState('tradein_created');
+        } catch (\Exception $e) {
+            Log::error('Create trade-in error', [
+                'error' => $e->getMessage(),
+                'session_id' => $session->id,
+            ]);
+            $this->sendMessage($session->phone_number, 'Teklif kaydedilirken bir hata oluştu. Lütfen tekrar deneyin.');
+            $session->updateState('start');
+        }
+    }
+
+    /**
+     * Show trade-in status.
+     *
+     * @param  \App\Models\BotSession  $session
+     * @return void
+     */
+    protected function showTradeInStatus(BotSession $session): void
+    {
+        $tradeInId = $session->data['tradein_id_search'] ?? null;
+
+        if (!$tradeInId) {
+            $this->sendMessage($session->phone_number, 'Teklif bulunamadı. Lütfen teklif numaranızı kontrol edin.');
+            $session->updateState('start');
+            return;
+        }
+
+        $tradeIn = TradeIn::with('customer')->find($tradeInId);
+
+        if (!$tradeIn) {
+            $this->sendMessage($session->phone_number, 'Teklif bulunamadı. Lütfen teklif numaranızı kontrol edin.');
+            $session->updateState('start');
+            return;
+        }
+
+        $statusEmoji = [
+            'new' => '🆕',
+            'waiting_device' => '⏳',
+            'completed' => '✅',
+            'canceled' => '❌',
+        ];
+
+        $conditionLabels = ['A' => 'Mükemmel', 'B' => 'İyi', 'C' => 'Orta'];
+
+        $message = "📱 *Teklif Durumu*\n\n";
+        $message .= "Teklif No: " . substr($tradeIn->id, 0, 8) . "\n";
+        $message .= "Durum: {$statusEmoji[$tradeIn->status] ?? ''} {$tradeIn->status_label}\n";
+        $message .= "Marka: {$tradeIn->brand}\n";
+        $message .= "Model: {$tradeIn->model}\n";
+        $message .= "Durum: {$conditionLabels[$tradeIn->condition] ?? 'Bilinmiyor'}\n";
+        
+        if ($tradeIn->storage) {
+            $message .= "Depolama: {$tradeIn->storage}\n";
+        }
+        if ($tradeIn->battery_health !== null) {
+            $message .= "Pil Sağlığı: %{$tradeIn->battery_health}\n";
+        }
+        
+        if ($tradeIn->offer_min && $tradeIn->offer_max) {
+            $message .= "Teklif: {$tradeIn->offer_min} - {$tradeIn->offer_max} TL\n";
+        }
+
+        $this->sendMessage($session->phone_number, $message);
+        $session->updateState('start');
     }
 }
 

@@ -70,7 +70,7 @@
         </div>
 
         <!-- Charts -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
             <div class="bg-white p-6 rounded-lg shadow">
                 <h2 class="text-lg font-semibold text-gray-900 mb-4">Tickets by Status</h2>
                 <div class="h-64">
@@ -85,13 +85,32 @@
                 </div>
             </div>
         </div>
+
+        <!-- Trade-In KPIs -->
+        <div class="bg-white p-6 rounded-lg shadow mb-6">
+            <h2 class="text-lg font-semibold text-gray-900 mb-4">Trade-In Payment Options</h2>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div>
+                    <h3 class="text-sm font-medium text-gray-700 mb-2">Conversion by Payment Option</h3>
+                    <div class="h-64">
+                        <BarChart :data="paymentConversionChartData" :options="{ responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, max: 100 } } }" />
+                    </div>
+                </div>
+                <div>
+                    <h3 class="text-sm font-medium text-gray-700 mb-2">Revenue by Payment Option</h3>
+                    <div class="h-64">
+                        <BarChart :data="paymentRevenueChartData" :options="{ responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }" />
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 </template>
 
 <script setup>
 import { ref, onMounted, computed } from 'vue';
 import { DocumentTextIcon, UserGroupIcon, CheckCircleIcon, ClockIcon } from '@heroicons/vue/24/outline';
-import { DoughnutChart, LineChart } from 'vue-chartjs';
+import { DoughnutChart, LineChart, BarChart } from 'vue-chartjs';
 import {
     Chart as ChartJS,
     ArcElement,
@@ -101,6 +120,7 @@ import {
     LinearScale,
     PointElement,
     LineElement,
+    BarElement,
     Title,
     Filler,
 } from 'chart.js';
@@ -114,12 +134,14 @@ ChartJS.register(
     LinearScale,
     PointElement,
     LineElement,
+    BarElement,
     Title,
     Filler
 );
 
 const stats = ref({});
 const ticketStats = ref({});
+const tradeInStats = ref({});
 
 const statusChartData = computed(() => ({
     labels: ['New', 'Directed', 'Completed', 'Canceled'],
@@ -144,14 +166,41 @@ const timeChartData = computed(() => ({
     }],
 }));
 
+const paymentConversionChartData = computed(() => ({
+    labels: ['Nakit', 'Aksesuar Çeki', 'Yeni Cihaz İndirim'],
+    datasets: [{
+        label: 'Conversion Rate (%)',
+        data: [
+            tradeInStats.value.conversion_by_payment_option?.cash || 0,
+            tradeInStats.value.conversion_by_payment_option?.voucher || 0,
+            tradeInStats.value.conversion_by_payment_option?.tradein || 0,
+        ],
+        backgroundColor: ['#10B981', '#3B82F6', '#F59E0B'],
+    }],
+}));
+
+const paymentRevenueChartData = computed(() => ({
+    labels: ['Nakit', 'Aksesuar Çeki', 'Yeni Cihaz İndirim'],
+    datasets: [{
+        label: 'Revenue (TL)',
+        data: [
+            tradeInStats.value.revenue_by_payment_option?.cash || 0,
+            tradeInStats.value.revenue_by_payment_option?.voucher || 0,
+            tradeInStats.value.revenue_by_payment_option?.tradein || 0,
+        ],
+        backgroundColor: ['#10B981', '#3B82F6', '#F59E0B'],
+    }],
+}));
+
 onMounted(async () => {
     try {
-        const [statsRes, ticketStatsRes] = await Promise.all([
+        const [ticketStatsRes, tradeInStatsRes] = await Promise.all([
             axios.get('/api/tickets/statistics'),
-            axios.get('/api/tickets/statistics'),
+            axios.get('/api/tradeins/statistics'),
         ]);
         
         ticketStats.value = ticketStatsRes.data;
+        tradeInStats.value = tradeInStatsRes.data;
         stats.value = {
             total_tickets: ticketStatsRes.data.total || 0,
             total_customers: 0, // Add API endpoint for this

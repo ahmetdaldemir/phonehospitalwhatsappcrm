@@ -39,6 +39,22 @@ class Customer extends BaseModel
     }
 
     /**
+     * Get the orders for the customer.
+     */
+    public function orders(): HasMany
+    {
+        return $this->hasMany(Order::class);
+    }
+
+    /**
+     * Get the trade-ins for the customer.
+     */
+    public function tradeIns(): HasMany
+    {
+        return $this->hasMany(TradeIn::class);
+    }
+
+    /**
      * Increment the visit count and update last visit.
      */
     public function recordVisit(): void
