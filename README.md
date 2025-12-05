@@ -18,8 +18,12 @@ A comprehensive Customer Relationship Management system built with Laravel 10+ a
 - PHP >= 8.2
 - Composer
 - Node.js >= 18.x and npm
-- MySQL 8+ or PostgreSQL 12+
+- MySQL 8+ or PostgreSQL 12+ (via Docker external stack)
+- Redis (via Docker external stack)
+- Docker & Docker Compose
 - Web server (Apache/Nginx) or PHP built-in server
+
+**Note:** This project uses external MySQL and Redis containers from `docker-datatabse-stack`. See [DOCKER_EXTERNAL_DB.md](DOCKER_EXTERNAL_DB.md) for configuration details.
 
 ## Installation
 
@@ -54,15 +58,30 @@ cp env.example .env
 
 Edit the `.env` file and configure your database connection:
 
-**For MySQL:**
+**For MySQL (Docker External):**
 ```env
 DB_CONNECTION=mysql
-DB_HOST=127.0.0.1
+DB_HOST=global_mysql
 DB_PORT=3306
 DB_DATABASE=phone_hospital_crm
 DB_USERNAME=root
 DB_PASSWORD=your_password
+
+# Redis Configuration
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_CACHE_DB=1
+
+# Cache and Queue
+CACHE_STORE=redis
+QUEUE_CONNECTION=redis
+
+# External Network
+EXTERNAL_NETWORK_NAME=docker-datatabse-stack_default
 ```
+
+**Note:** This project connects to external MySQL (`global_mysql`) and Redis containers from `docker-datatabse-stack`. Make sure the stack is running before starting this project.
 
 **For PostgreSQL:**
 ```env
@@ -80,33 +99,64 @@ DB_PASSWORD=your_password
 php artisan key:generate
 ```
 
-### 6. Create Database
+### 6. Docker Setup
 
-Create a new database in MySQL or PostgreSQL:
+**Important:** This project uses external MySQL and Redis from `docker-datatabse-stack`.
 
-**MySQL:**
+1. Ensure `docker-datatabse-stack` is running:
+```bash
+cd /path/to/docker-datatabse-stack
+docker-compose up -d
+```
+
+2. Verify network exists:
+```bash
+docker network ls | grep docker-datatabse-stack
+```
+
+3. Start this project:
+```bash
+docker-compose up -d
+```
+
+For detailed Docker configuration, see [DOCKER_EXTERNAL_DB.md](DOCKER_EXTERNAL_DB.md).
+
+### 7. Create Database
+
+Create a new database in MySQL (via `global_mysql` container):
+
 ```sql
 CREATE DATABASE phone_hospital_crm CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 ```
 
-**PostgreSQL:**
-```sql
-CREATE DATABASE phone_hospital_crm;
+Or via Docker:
+```bash
+docker exec -it global_mysql mysql -uroot -p -e "CREATE DATABASE phone_hospital_crm CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 ```
 
-### 7. Run Migrations
+### 8. Run Migrations
 
+```bash
+docker-compose exec app php artisan migrate
+```
+
+Or if running locally (without Docker):
 ```bash
 php artisan migrate
 ```
 
-### 8. Create Storage Link
+### 9. Create Storage Link
 
+```bash
+docker-compose exec app php artisan storage:link
+```
+
+Or if running locally (without Docker):
 ```bash
 php artisan storage:link
 ```
 
-### 9. Build Frontend Assets
+### 10. Build Frontend Assets
 
 For development:
 ```bash

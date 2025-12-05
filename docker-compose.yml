@@ -13,14 +13,12 @@ services:
       - ./docker/php/local.ini:/usr/local/etc/php/conf.d/local.ini
     networks:
       - phone_hospital_network
-    depends_on:
-      - mysql
-      - redis
+      - database_stack_network
     environment:
-      - DB_HOST=mysql
-      - DB_PORT=3306
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - DB_HOST=${DB_HOST:-global_mysql}
+      - DB_PORT=${DB_PORT:-3306}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
 
   nginx:
     image: nginx:alpine
@@ -38,35 +36,6 @@ services:
     depends_on:
       - app
 
-  mysql:
-    image: mysql:8.0
-    container_name: phone_hospital_mysql
-    restart: unless-stopped
-    ports:
-      - "3306:3306"
-    environment:
-      MYSQL_DATABASE: ${DB_DATABASE:-phone_hospital_crm}
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-root}
-      MYSQL_PASSWORD: ${DB_PASSWORD:-root}
-      MYSQL_USER: ${DB_USERNAME:-root}
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./docker/mysql/my.cnf:/etc/mysql/conf.d/my.cnf
-    networks:
-      - phone_hospital_network
-
-  redis:
-    image: redis:7-alpine
-    container_name: phone_hospital_redis
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - phone_hospital_network
-    command: redis-server --appendonly yes
-
   queue:
     build:
       context: .
@@ -78,15 +47,13 @@ services:
       - ./:/var/www/html
     networks:
       - phone_hospital_network
-    depends_on:
-      - mysql
-      - redis
+      - database_stack_network
     command: php artisan queue:work --sleep=3 --tries=3 --max-time=3600
     environment:
-      - DB_HOST=mysql
-      - DB_PORT=3306
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - DB_HOST=${DB_HOST:-global_mysql}
+      - DB_PORT=${DB_PORT:-3306}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
 
   scheduler:
     build:
@@ -99,25 +66,21 @@ services:
       - ./:/var/www/html
     networks:
       - phone_hospital_network
-    depends_on:
-      - mysql
+      - database_stack_network
     command: >
       sh -c "while true; do
         php artisan schedule:run --verbose --no-interaction &
         sleep 60
       done"
     environment:
-      - DB_HOST=mysql
-      - DB_PORT=3306
-
-volumes:
-  mysql_data:
-    driver: local
-  redis_data:
-    driver: local
+      - DB_HOST=${DB_HOST:-global_mysql}
+      - DB_PORT=${DB_PORT:-3306}
 
 networks:
   phone_hospital_network:
     driver: bridge
+  database_stack_network:
+    external: true
+    name: ${EXTERNAL_NETWORK_NAME:-docker-datatabse-stack_default}
 
 
